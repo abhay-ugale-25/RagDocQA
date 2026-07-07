@@ -66,7 +66,7 @@ flowchart TD
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone  https://github.com/abhay-ugale-25/RagDocQA.git
 cd rag_dev
 
 # Create and activate a virtual environment
@@ -177,8 +177,6 @@ curl -X POST http://127.0.0.1:8000/query \
 
 ## How It Works
 
-> A plain-English explanation for someone with no ML background.
-
 ### The Problem
 
 Imagine you have a 50-page research paper and you want to ask it questions like a conversation. You *could* paste the whole thing into ChatGPT — but what if it's too long? What if you have 100 documents? That's where RAG comes in.
@@ -223,7 +221,6 @@ rag_dev/
 │   └── schemas.py       ← Pydantic request/response models
 ├── data/                ← uploaded documents land here
 ├── vectorstore/         ← ChromaDB persists embeddings here
-├── .env                 ← GOOGLE_API_KEY (git-ignored)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
