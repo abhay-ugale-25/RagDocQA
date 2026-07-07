@@ -66,7 +66,7 @@ flowchart TD
 
 ```bash
 # Clone the repository
-git clone <your-repo-url>
+git clone  https://github.com/abhay-ugale-25/RagDocQA.git
 cd rag_dev
 
 # Create and activate a virtual environment
@@ -176,8 +176,6 @@ curl -X POST http://127.0.0.1:8000/query \
 ---
 
 ## How It Works
-
-> A plain-English explanation for someone with no ML background.
 
 ### The Problem
 
