@@ -223,7 +223,6 @@ rag_dev/
 │   └── schemas.py       ← Pydantic request/response models
 ├── data/                ← uploaded documents land here
 ├── vectorstore/         ← ChromaDB persists embeddings here
-├── .env                 ← GOOGLE_API_KEY (git-ignored)
 ├── .env.example
 ├── .gitignore
 ├── requirements.txt
