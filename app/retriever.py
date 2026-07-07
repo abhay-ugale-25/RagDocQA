@@ -1,5 +1,3 @@
-# app/retriever.py — Embed query → search → rerank → prompt → LLM retrieval pipeline.
-
 import os
 from typing import Any
 
@@ -17,11 +15,8 @@ from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
-# ── Cross-encoder reranker model (loaded once) ───────────────
 RERANK_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-# ── Custom prompt ────────────────────────────────────────────
-# Instructs the LLM to answer strictly from the provided context.
 PROMPT_TEMPLATE = """\
 Given the following extracted parts of a long document and a question,
 create a final answer with references ("SOURCES").
@@ -41,10 +36,8 @@ QA_PROMPT = PromptTemplate(
 
 
 class RerankedRetriever(BaseRetriever):
-    """Wraps a base retriever and reranks results with a CrossEncoder."""
-
-    base_retriever: Any  # EnsembleRetriever
-    cross_encoder: Any  # CrossEncoder instance
+    base_retriever: Any
+    cross_encoder: Any
     top_k: int = 4
 
     class Config:
@@ -53,34 +46,22 @@ class RerankedRetriever(BaseRetriever):
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun
     ) -> list[Document]:
-        # Step 1: Get merged candidates from ensemble
         candidates = self.base_retriever.invoke(query)
 
         if not candidates:
             return []
 
-        # Step 2: Score every (query, chunk) pair with the cross-encoder
         pairs = [(query, doc.page_content) for doc in candidates]
         scores = self.cross_encoder.predict(pairs)
 
-        # Step 3: Sort descending by relevance score
         scored_docs = sorted(
             zip(scores, candidates), key=lambda x: x[0], reverse=True
         )
 
-        # Step 4: Keep only top_k
         return [doc for _, doc in scored_docs[: self.top_k]]
 
 
 def load_vectorstore() -> Chroma:
-    """Load the persisted Chroma vectorstore from disk.
-
-    Uses the same embedding model and collection name as ingest.py
-    to ensure embeddings are compatible.
-
-    Returns:
-        A Chroma vectorstore instance loaded from ./vectorstore.
-    """
     embeddings = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001",
         google_api_key=os.getenv("GOOGLE_API_KEY"),
@@ -96,20 +77,9 @@ def load_vectorstore() -> Chroma:
 
 
 def build_qa_chain(vectorstore: Chroma) -> RetrievalQAWithSourcesChain:
-    """Build a RetrievalQA chain from a Chroma vectorstore.
-
-    Args:
-        vectorstore: A Chroma instance to use as the retrieval backend.
-
-    Returns:
-        A RetrievalQAWithSourcesChain ready to answer questions.
-    """
-    # Vector retriever (semantic similarity)
     retriever_vector = vectorstore.as_retriever(search_kwargs={"k": 8})
 
-    # BM25 retriever (keyword matching) built from all stored documents
     all_docs = vectorstore.get()
-    from langchain_core.documents import Document
 
     bm25_docs = [
         Document(page_content=text, metadata=meta)
@@ -117,13 +87,11 @@ def build_qa_chain(vectorstore: Chroma) -> RetrievalQAWithSourcesChain:
     ]
     retriever_bm25 = BM25Retriever.from_documents(bm25_docs, k=8)
 
-    # Hybrid ensemble: 60% vector + 40% BM25
     ensemble = EnsembleRetriever(
         retrievers=[retriever_vector, retriever_bm25],
         weights=[0.6, 0.4],
     )
 
-    # Cross-encoder reranking: score all candidates, keep top 4
     retriever = RerankedRetriever(
         base_retriever=ensemble,
         cross_encoder=RERANK_MODEL,
