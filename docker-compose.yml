@@ -1,0 +1,13 @@
+# docker-compose.yml:
+services:
+  rag-api:
+    build: .
+    container_name: ragdocqa-service
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./data:/app/data
+      - ./vectorstore:/app/vectorstore
+    restart: unless-stopped

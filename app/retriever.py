@@ -1,21 +1,52 @@
+import logging
 import os
-from typing import Any
+from typing import Any, Optional
 
 from dotenv import load_dotenv
-from langchain.chains import RetrievalQAWithSourcesChain
-from langchain.prompts import PromptTemplate
-from langchain.retrievers import EnsembleRetriever
+
+try:
+    from langchain_core.prompts import PromptTemplate
+except ImportError:
+    from langchain.prompts import PromptTemplate
+
+try:
+    from langchain.retrievers import EnsembleRetriever
+except ImportError:
+    from langchain_classic.retrievers import EnsembleRetriever
+
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import Chroma
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
+from langchain_core.runnables import RunnableLambda
+from langchain_google_genai import ChatGoogleGenerativeAI
+from pydantic import ConfigDict
 from sentence_transformers import CrossEncoder
 
-load_dotenv()
+from app.ingest import get_embeddings
 
-RERANK_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+load_dotenv()
+logger = logging.getLogger(__name__)
+
+_RERANK_MODEL: Optional[CrossEncoder] = None
+
+
+def get_rerank_model() -> CrossEncoder:
+    """Return a singleton instance of the CrossEncoder reranking model."""
+    global _RERANK_MODEL
+    if _RERANK_MODEL is None:
+        logger.info("Loading CrossEncoder model: cross-encoder/ms-marco-MiniLM-L-6-v2")
+        _RERANK_MODEL = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _RERANK_MODEL
+
+
+def __getattr__(name: str) -> Any:
+    """Provide lazy backwards compatibility for module-level RERANK_MODEL access."""
+    if name == "RERANK_MODEL":
+        return get_rerank_model()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
 
 PROMPT_TEMPLATE = """\
 Given the following extracted parts of a long document and a question,
@@ -40,12 +71,10 @@ class RerankedRetriever(BaseRetriever):
     cross_encoder: Any
     top_k: int = 4
 
-    class Config:
-        arbitrary_types_allowed = True
+    model_config = ConfigDict(arbitrary_types_allowed=True)
 
-    def _get_relevant_documents(
-        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
-    ) -> list[Document]:
+    def rerank(self, query: str, top_k: Optional[int] = None) -> list[Document]:
+        k = top_k if top_k is not None else self.top_k
         candidates = self.base_retriever.invoke(query)
 
         if not candidates:
@@ -58,14 +87,21 @@ class RerankedRetriever(BaseRetriever):
             zip(scores, candidates), key=lambda x: x[0], reverse=True
         )
 
-        return [doc for _, doc in scored_docs[: self.top_k]]
+        top_docs = []
+        for score, doc in scored_docs[:k]:
+            doc.metadata["rerank_score"] = float(score)
+            top_docs.append(doc)
+
+        return top_docs
+
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun
+    ) -> list[Document]:
+        return self.rerank(query, top_k=self.top_k)
 
 
 def load_vectorstore() -> Chroma:
-    embeddings = GoogleGenerativeAIEmbeddings(
-        model="models/gemini-embedding-001",
-        google_api_key=os.getenv("GOOGLE_API_KEY"),
-    )
+    embeddings = get_embeddings()
 
     vectorstore = Chroma(
         persist_directory="./vectorstore",
@@ -76,25 +112,42 @@ def load_vectorstore() -> Chroma:
     return vectorstore
 
 
-def build_qa_chain(vectorstore: Chroma) -> RetrievalQAWithSourcesChain:
+def format_documents(docs: list[Document]) -> str:
+    """Format retrieved documents into a context block for the LLM prompt."""
+    if not docs:
+        return "No relevant context found."
+
+    formatted_parts = []
+    for doc in docs:
+        source = doc.metadata.get("source", "Unknown")
+        formatted_parts.append(f"Content: {doc.page_content}\nSource: {source}")
+    return "\n\n".join(formatted_parts)
+
+
+def build_qa_chain(vectorstore: Chroma) -> RunnableLambda:
     retriever_vector = vectorstore.as_retriever(search_kwargs={"k": 8})
 
     all_docs = vectorstore.get()
+    doc_texts = all_docs.get("documents", []) or []
+    doc_metas = all_docs.get("metadatas", []) or [{}] * len(doc_texts)
 
-    bm25_docs = [
-        Document(page_content=text, metadata=meta)
-        for text, meta in zip(all_docs["documents"], all_docs["metadatas"])
-    ]
-    retriever_bm25 = BM25Retriever.from_documents(bm25_docs, k=8)
+    if doc_texts:
+        bm25_docs = [
+            Document(page_content=text, metadata=meta or {})
+            for text, meta in zip(doc_texts, doc_metas)
+        ]
+        retriever_bm25 = BM25Retriever.from_documents(bm25_docs, k=8)
 
-    ensemble = EnsembleRetriever(
-        retrievers=[retriever_vector, retriever_bm25],
-        weights=[0.6, 0.4],
-    )
+        base_retriever = EnsembleRetriever(
+            retrievers=[retriever_vector, retriever_bm25],
+            weights=[0.6, 0.4],
+        )
+    else:
+        base_retriever = retriever_vector
 
     retriever = RerankedRetriever(
-        base_retriever=ensemble,
-        cross_encoder=RERANK_MODEL,
+        base_retriever=base_retriever,
+        cross_encoder=get_rerank_model(),
         top_k=4,
     )
 
@@ -104,12 +157,28 @@ def build_qa_chain(vectorstore: Chroma) -> RetrievalQAWithSourcesChain:
         temperature=0,
     )
 
-    chain = RetrievalQAWithSourcesChain.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=retriever,
-        chain_type_kwargs={"prompt": QA_PROMPT},
-        return_source_documents=True,
-    )
+    def execute_rag(inputs: dict[str, Any]) -> dict[str, Any]:
+        question = inputs.get("question", "")
+        top_k = inputs.get("top_k", retriever.top_k)
 
-    return chain
+        # Retrieve documents and apply cross-encoder reranking
+        docs = retriever.rerank(question, top_k=top_k)
+
+        summaries = format_documents(docs)
+        prompt_val = QA_PROMPT.format(question=question, summaries=summaries)
+        response = llm.invoke(prompt_val)
+
+        if isinstance(response.content, list):
+            answer_text = "".join(
+                item if isinstance(item, str) else item.get("text", "")
+                for item in response.content
+            )
+        else:
+            answer_text = str(response.content)
+
+        return {
+            "answer": answer_text.strip(),
+            "source_documents": docs,
+        }
+
+    return RunnableLambda(execute_rag)

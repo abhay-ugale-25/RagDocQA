@@ -1,6 +1,8 @@
 # 📄 RAG Document QA
 
-A **Retrieval-Augmented Generation** API that lets you upload documents (PDF/TXT), automatically chunks and embeds them into a vector store, and then answers natural-language questions grounded strictly in the uploaded content. The system combines semantic search with keyword matching via a hybrid retriever, reranks candidates using a cross-encoder model, and generates answers with Google's Gemini LLM — ensuring responses are always traceable back to source documents and never hallucinated from outside knowledge.
+A **production-grade Retrieval-Augmented Generation** API that lets you upload documents (PDF/TXT), automatically chunks and embeds them into a vector store, and then answers natural-language questions grounded strictly in the uploaded content. The system combines semantic search with keyword matching via a hybrid retriever, reranks candidates using a cross-encoder model, and generates answers with Google's Gemini LLM — ensuring responses are always traceable back to source documents and never hallucinated from outside knowledge.
+
+**Production features:** non-blocking async I/O via thread pool offloading, Pydantic v2 input validation with whitespace stripping, file path sanitization with size limits, singleton resource management, structured logging, configurable `top_k` retrieval, per-query latency tracking, cross-encoder rerank scores in API responses, and a deterministic LCEL pipeline replacing the deprecated `RetrievalQAWithSourcesChain`.
 
 ---
 
@@ -12,14 +14,18 @@ The system runs two pipelines through a single FastAPI server:
 
 ```mermaid
 flowchart LR
-    A["📄 Upload PDF/TXT"] --> B["📖 Document Loader<br/>(PyPDF / TextLoader)"]
-    B --> C["✂️ Text Splitter<br/>(800 chars, 150 overlap)"]
-    C --> D["🧠 Gemini Embeddings<br/>(gemini-embedding-001)"]
-    D --> E[("💾 ChromaDB<br/>(persisted to disk)")]
+    A["📄 Upload PDF/TXT\n(≤ 20 MB)"] --> V["🛡️ Validate\n(sanitize path, check ext)"]
+    V --> B["📖 Document Loader\n(PyPDF / TextLoader)"]
+    B --> C["✂️ Text Splitter\n(800 chars, 150 overlap)"]
+    C --> CHK["✅ Non-empty\nchunk check"]
+    CHK --> D["🧠 Gemini Embeddings\n(singleton instance)"]
+    D --> E[("💾 ChromaDB\n(persisted to disk)")]
 
     style A fill:#4a9eff,color:#fff,stroke:none
+    style V fill:#e17055,color:#fff,stroke:none
     style B fill:#6c5ce7,color:#fff,stroke:none
     style C fill:#6c5ce7,color:#fff,stroke:none
+    style CHK fill:#e17055,color:#fff,stroke:none
     style D fill:#00b894,color:#fff,stroke:none
     style E fill:#fdcb6e,color:#333,stroke:none
 ```
@@ -28,20 +34,20 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    Q["❓ User Question"] --> E1
+    Q["❓ User Question\n+ top_k (1–10)"] --> E1
     Q --> E2
 
     subgraph ensemble ["Ensemble Retriever"]
-        E1["🔍 Vector Search<br/>(weight: 0.6, k=8)"]
-        E2["🔤 BM25 Keyword Search<br/>(weight: 0.4, k=8)"]
+        E1["🔍 Vector Search\n(weight: 0.6, k=8)"]
+        E2["🔤 BM25 Keyword Search\n(weight: 0.4, k=8)"]
     end
 
     E1 --> M["📋 Merged Candidates"]
     E2 --> M
 
-    M --> R["⚖️ Cross-Encoder Reranker<br/>(ms-marco-MiniLM-L-6-v2)<br/>Keep top 4"]
-    R --> L["🤖 Gemini LLM<br/>(context-only answering)"]
-    L --> A["✅ Answer + Sources<br/>(reranked: true)"]
+    M --> R["⚖️ Cross-Encoder Reranker\n(ms-marco-MiniLM-L-6-v2)\nKeep top_k + scores"]
+    R --> L["🤖 Gemini LLM via LCEL\n(context-only answering)"]
+    L --> A["✅ Answer + Sources\n+ latency_ms + rerank_scores"]
 
     style Q fill:#4a9eff,color:#fff,stroke:none
     style ensemble fill:#f8f9fa,stroke:#ddd,stroke-width:2px
@@ -126,9 +132,15 @@ curl -X POST http://127.0.0.1:8000/ingest \
 }
 ```
 
-| Parameter | Type       | Description                     |
-|-----------|------------|---------------------------------|
-| `file`    | `UploadFile` | PDF or TXT file to ingest     |
+| Parameter | Type         | Description                                        |
+|-----------|--------------|----------------------------------------------------|
+| `file`    | `UploadFile` | PDF or TXT file to ingest (max 20 MB)              |
+
+**Validation & Error Handling:**
+- Filenames are sanitized via `os.path.basename()` to prevent path traversal.
+- Files exceeding **20 MB** are rejected with `400 Bad Request`.
+- Unsupported file extensions (anything other than `.pdf` / `.txt`) return `400`.
+- Documents producing **zero text chunks** return `400` with `"No extractable text found in document."`
 
 ---
 
@@ -137,23 +149,34 @@ curl -X POST http://127.0.0.1:8000/ingest \
 ```bash
 curl -X POST http://127.0.0.1:8000/query \
   -H "Content-Type: application/json" \
-  -d '{"question": "What is the main contribution of this paper?"}'
+  -d '{"question": "What is the main contribution of this paper?", "top_k": 4}'
 ```
+
+**Request Body**
+
+| Field      | Type     | Required | Description                                                     |
+|------------|----------|----------|-----------------------------------------------------------------|
+| `question` | `string` | ✅       | Natural-language question (3–2000 chars, whitespace auto-stripped) |
+| `top_k`    | `int`    | ❌       | Number of reranked chunks to use (1–10, default: 4)             |
 
 **Response** `200 OK`
 ```json
 {
   "answer": "The main contribution of this paper is the introduction of the Transformer...",
   "sources": ["my_paper.pdf"],
-  "reranked": true
+  "reranked": true,
+  "latency_ms": 1523.47,
+  "rerank_scores": [0.9987, 0.9412, 0.8876, 0.7103]
 }
 ```
 
-| Field      | Type         | Description                                              |
-|------------|--------------|----------------------------------------------------------|
-| `answer`   | `string`     | LLM-generated answer grounded in the uploaded documents  |
-| `sources`  | `list[str]`  | Source filenames the answer was derived from              |
-| `reranked` | `bool\|null` | Whether cross-encoder reranking was applied              |
+| Field           | Type           | Description                                              |
+|-----------------|----------------|----------------------------------------------------------|
+| `answer`        | `string`       | LLM-generated answer grounded in the uploaded documents  |
+| `sources`       | `list[str]`    | Source filenames the answer was derived from              |
+| `reranked`      | `bool\|null`   | Whether cross-encoder reranking was applied              |
+| `latency_ms`    | `float`        | End-to-end query latency in milliseconds                 |
+| `rerank_scores` | `list[float]`  | Cross-encoder relevance scores for each returned chunk   |
 
 ---
 
@@ -161,17 +184,19 @@ curl -X POST http://127.0.0.1:8000/query \
 
 | Component             | Library                          | Why                                                                 |
 |-----------------------|----------------------------------|---------------------------------------------------------------------|
-| **Web Framework**     | FastAPI 0.111                    | Async-first, auto-generated OpenAPI docs, Pydantic validation       |
-| **ASGI Server**       | Uvicorn 0.30                     | Lightning-fast ASGI server, hot-reload for development              |
+| **Web Framework**     | FastAPI                          | Async-first, auto-generated OpenAPI docs, Pydantic v2 validation    |
+| **ASGI Server**       | Uvicorn                          | Lightning-fast ASGI server, hot-reload for development              |
 | **LLM**              | Gemini 3.1 Flash Lite            | Fast, low-latency responses; generous free-tier quota               |
 | **Embeddings**        | Gemini Embedding 001             | High-quality dense embeddings optimized for retrieval               |
-| **Vector Store**      | ChromaDB 0.5                     | Simple, file-persisted vector DB — zero infrastructure overhead     |
-| **Orchestration**     | LangChain 0.2                    | Composable chains for retrieval QA; handles prompt templating       |
-| **PDF Parsing**       | PyPDF 4.2                        | Reliable text extraction from PDF documents                         |
-| **Keyword Search**    | rank-bm25 0.2                    | Classic TF-IDF style retriever for exact keyword matching            |
-| **Reranker**          | sentence-transformers 3.0 (CrossEncoder) | `ms-marco-MiniLM-L-6-v2` scores query-document relevance precisely |
-| **Validation**        | Pydantic 2.7                     | Type-safe request/response models with auto-generated JSON schemas  |
-| **Config**            | python-dotenv 1.0                | Loads API keys from `.env` — keeps secrets out of code              |
+| **Vector Store**      | ChromaDB                         | Simple, file-persisted vector DB — zero infrastructure overhead     |
+| **Orchestration**     | LangChain Core (LCEL)            | Deterministic `RunnableLambda` pipeline; no deprecated chain classes|
+| **PDF Parsing**       | PyPDF                            | Reliable text extraction from PDF documents                         |
+| **Keyword Search**    | rank-bm25                        | Classic TF-IDF style retriever for exact keyword matching            |
+| **Reranker**          | sentence-transformers (CrossEncoder) | `ms-marco-MiniLM-L-6-v2` scores query-document relevance precisely |
+| **Validation**        | Pydantic v2                      | Type-safe models with `Field` constraints, validators, and `ConfigDict` |
+| **Async I/O**         | `run_in_threadpool`              | Offloads blocking calls to thread pool; keeps the event loop free   |
+| **Logging**           | Python `logging`                 | Structured, leveled logging replacing `print()` statements          |
+| **Config**            | python-dotenv                    | Loads API keys from `.env` — keeps secrets out of code              |
 
 ---
 
@@ -199,13 +224,13 @@ The results from both searches are merged together, giving you the best of both 
 
 ### Step 3: Reranking (Picking the Best of the Best)
 
-The merged list might have 10–15 candidate chunks, but not all are equally relevant. A specialized **reranker model** reads each chunk side-by-side with your question and assigns a relevance score. Only the **top 4 highest-scoring chunks** survive — this dramatically improves answer quality by filtering out noise.
+The merged list might have 10–15 candidate chunks, but not all are equally relevant. A specialized **reranker model** reads each chunk side-by-side with your question and assigns a relevance score. Only the **top `top_k` highest-scoring chunks** survive (configurable from 1–10, default 4) — this dramatically improves answer quality by filtering out noise. Each chunk's cross-encoder score is stored in its metadata and returned in the API response as `rerank_scores`.
 
 ### Step 4: Generation (Writing the Answer)
 
-Those 4 carefully-selected chunks are inserted into a prompt template that tells the LLM: *"Answer this question using ONLY the following context. If the answer isn't there, say you don't know."* The LLM (Gemini) then writes a natural-language answer and cites which source documents it used.
+Those carefully-selected chunks are formatted into a context block and passed directly to the LLM via a deterministic **LCEL `RunnableLambda` pipeline** (replacing the deprecated `RetrievalQAWithSourcesChain`). The prompt instructs the LLM: *"Answer this question using ONLY the following context. If the answer isn't there, say you don't know."* The LLM (Gemini) then writes a natural-language answer and cites which source documents it used.
 
-The result: an answer that's **always grounded in your actual documents**, never made up.
+The result: an answer that's **always grounded in your actual documents**, never made up — with full latency metrics and reranking confidence scores.
 
 ---
 
@@ -215,10 +240,10 @@ The result: an answer that's **always grounded in your actual documents**, never
 rag_dev/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py          ← FastAPI app, routes, lifespan
-│   ├── ingest.py        ← load → chunk → embed → store
-│   ├── retriever.py     ← ensemble search → rerank → LLM chain
-│   └── schemas.py       ← Pydantic request/response models
+│   ├── main.py          ← FastAPI app, routes, lifespan, async threadpool I/O
+│   ├── ingest.py        ← validate → load → chunk → embed → store (singleton embeddings)
+│   ├── retriever.py     ← ensemble search → rerank (with scores) → LCEL LLM pipeline
+│   └── schemas.py       ← Pydantic v2 request/response models with validation
 ├── data/                ← uploaded documents land here
 ├── vectorstore/         ← ChromaDB persists embeddings here
 ├── .env.example
