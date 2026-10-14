@@ -21,6 +21,7 @@ from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 from langchain_core.runnables import RunnableLambda
 from langchain_google_genai import ChatGoogleGenerativeAI
+import numpy as np
 from pydantic import ConfigDict
 from sentence_transformers import CrossEncoder
 
@@ -89,7 +90,8 @@ class RerankedRetriever(BaseRetriever):
 
         top_docs = []
         for score, doc in scored_docs[:k]:
-            doc.metadata["rerank_score"] = float(score)
+            normalized_score = round(float(1.0 / (1.0 + np.exp(-float(score)))), 4)
+            doc.metadata["rerank_score"] = normalized_score
             top_docs.append(doc)
 
         return top_docs
