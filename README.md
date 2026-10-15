@@ -1,4 +1,6 @@
 # 📄 RAG Document QA
+![CI](https://github.com/abhay-ugale-25/RagDocQA/actions/workflows/ci.yml/badge.svg)
+
 
 A **production-grade Retrieval-Augmented Generation** API that lets you upload documents (PDF/TXT), automatically chunks and embeds them into a vector store, and then answers natural-language questions grounded strictly in the uploaded content. The system combines semantic search with keyword matching via a hybrid retriever, reranks candidates using a cross-encoder model, and generates answers with Google's Gemini LLM — ensuring responses are always traceable back to source documents and never hallucinated from outside knowledge.
 

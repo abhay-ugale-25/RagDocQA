@@ -8,12 +8,9 @@ from langchain_core.documents import Document
 # Mock environment variables BEFORE importing main to avoid initialization errors
 os.environ["GOOGLE_API_KEY"] = "dummy-key-for-tests"
 
-from app import ingest
-from app import retriever
-
-# Mock the embeddings and CrossEncoder instantiation at the module level
-with patch("app.ingest.GoogleGenerativeAIEmbeddings"), \
-     patch("app.retriever.CrossEncoder"):
+# Mock the underlying libraries before anything from app is imported
+with patch("sentence_transformers.CrossEncoder"), \
+     patch("langchain_google_genai.GoogleGenerativeAIEmbeddings"):
     from fastapi.testclient import TestClient
     from app.main import app, DATA_DIR
 
